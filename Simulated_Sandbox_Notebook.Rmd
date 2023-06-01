@@ -1,0 +1,1716 @@
+---
+title: "DENSIFICAR Project Notebook"
+author: Jeremiah J. Nieves
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 2
+    number_sections: true
+---
+<!-- Note: For formatting, this Notebook requires the bookdown package  -->
+<!--  Set scrollable code and preview blocks and limit the code window size  -->
+```{css, include = FALSE, echo = FALSE}
+pre {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+pre[class] {
+  max-height: 300px;
+}
+```
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+options(prompt = 'R> ', continue = '+ ', width = 80)
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+require(knitr)
+require(sf)
+require(spdep)
+require(dplyr)
+require(raster)
+require(fasterize)
+require(log4r)
+require(data.table)
+require(snow)
+require(parallel)
+require(ggplot2)
+require(gridExtra)
+require(MASS)
+require(tidyr)
+
+
+root <- "D:/"
+prj_dir <- paste0(root,"/Research/Mexico_2021/")
+```
+
+
+```{r common_utility_functions_invisible, include = FALSE, message = FALSE, warning = FALSE}
+##  Function to make sure directories exist:
+ensure_dir <- function(d){
+  ##  Function for ensuring that a directory exists and creating it if it does 
+  ##  not; returns the path of the input path
+  if (!dir.exists(d)) {
+    dir.create(d)
+  }
+  return(d)
+}
+
+
+##  Function to load and or install packages:
+package_prep <- function(...){
+  libs <- unlist(list(...))
+  ##  Check if the packages can be loaded and are already installed:
+  req <- unlist(lapply(libs, require, character.only = TRUE))
+  ##  Packages we need to install:
+  need <- libs[req = FALSE]
+  if (length(need) > 0) {
+    ##  Install the needed packages
+    install.packages(need)
+    ##  Load the just installed packages:
+    lapply(need, require,character.only = TRUE)
+  }
+}
+
+
+
+
+# Authors: Maksym Bondarenko mb4@soton.ac.uk
+# Date :  October 2017
+# Version 0.1
+#
+#' wpGetOS function will return a string with OS
+#' of the system
+#' Tested on Windows 10
+
+#' @rdname wpGetOS
+#' @return string
+wpGetOS <- function(){
+  sysinf <- Sys.info()
+  if (!is.null(sysinf)) {
+    OS <- tolower(sysinf['sysname'])
+    if (OS == 'windows') {
+      return('windows')
+    } else if (OS == 'darwin') {
+      return('osx')
+    } else if (OS == 'linux') {
+      return('linux')
+    }
+  } else { ## other OS
+    OS <- .Platform$OS.type
+    if (grepl("^darwin", R.version$os))
+      return('osx')
+    if (grepl("linux-gnu", R.version$os))
+      return('linux')
+  }
+}
+
+
+
+
+# Authors: Maksym Bondarenko mb4@soton.ac.uk
+# Date :  October 2017
+# Version 0.1
+#
+#' wpGetAvalMem function will return avalible
+#' of the system memory in GB
+#' Tested on Windows 10
+#'
+#' @rdname wpGetAvalMem
+#' @return numeric
+wpGetAvalMem <- function(){
+  
+  OS = tolower(wpGetOS())
+  
+  if (OS == 'windows') {
+    memavail = shell('wmic OS get FreePhysicalMemory /Value', intern = T)
+    memavail = memavail[grep('FreePhysicalMemory', memavail)]
+    memavail = as.numeric(gsub('FreePhysicalMemory=','',memavail))
+  }else if (OS == 'osx') {
+    memavail = as.numeric(unlist(strsplit(system("sysctl hw.memsize", intern = T), split = ' '))[2])/1e3
+  }else{
+    memavail = as.numeric(system(" awk '/MemTotal/ {print $2}' /proc/meminfo", intern = T))
+  }
+  
+  return(memavail / (1024 * 1024))
+}
+
+
+
+
+# Authors: Maksym Bondarenko mb4@soton.ac.uk
+# Date :  October 2017
+# Version 0.1
+#
+#' wpGetBlocksNeed function will return a number of blocks
+#' sugesting for processing raster file. It will take into consideration
+#' number of layers, cells, cores and avalible memory on computer
+#' (not maximum memory but avalible)
+#' @param x raster
+#' @param cores number of cores
+#' @param n parameter to increase requrement of the raster
+#' @param number_type Will be used to estimate requred memory
+#' @rdname wpGetBlocksNeed
+#' @return integer
+#' @export
+#' @examples
+#' wpGetBlocksNeed( x, cores=2, n=1 )
+#'
+wpGetBlocksNeed <- function(x, cores, n=1, number_type = "numeric"){
+  
+  #stopifnot(hasValues(x))
+  
+  n <- n + nlayers(x) - 1
+  cells <- round( 1.1 * ncell(x) ) * n
+  #memneed <- cells * 8 * n / (1024 * 1024)
+  
+  if (number_type == "integer") {
+    
+    byte_per_number = 4
+    
+  } else if (number_type == "numeric") {
+    
+    byte_per_number = 8
+    
+  } else {
+    
+    #byte_per_number = .Machine$sizeof.pointer
+    stop(sprintf("Unknown number_type: %s", number_type))
+  }
+  
+  blocks <- 1
+  
+  memneed <- (cells * byte_per_number * n / (1024 * 1024 * 1024))/blocks
+  
+  memavail <- wpGetAvalMem()/cores
+  
+  while ((memneed > memavail)) {
+    
+    memneed <- (cells * byte_per_number * n / (1024 * 1024 * 1024))/blocks
+    blocks <- blocks + 1
+  }
+  
+  if ( blocks < cores) blocks <- cores
+  
+  return(blocks)
+  
+}
+
+
+
+
+##  https://github.com/worldpopglobal/wpUtilities/blob/master/R/wpProgressMessage.R
+wpProgressMessage <- function(x, 
+                              max = 100,
+                              label=NULL) {
+  
+  if (is.null(label)) label = ''
+  if (x != max) ar = '>' else ar = ''
+  
+  percent <- x / max * 100
+  cat(sprintf('\r[%-50s] %d%% %s',
+              paste(paste(rep('=', percent / 2), collapse = ''),'',sep = ar),
+              floor(percent),
+              label))
+  if (x == max)
+    cat('\n')
+}
+
+
+
+
+##  https://github.com/worldpopglobal/wpUtilities/blob/master/R/wpTimeDiff.R
+wpTimeDiff <- function(start, end, frm="hms") {
+  
+  dsec <- as.numeric(difftime(end, start, units = c("secs")))
+  hours <- floor(dsec / 3600)
+  
+  if (frm == "hms" ) {
+    minutes <- floor((dsec - 3600 * hours) / 60)
+    seconds <- dsec - 3600*hours - 60*minutes
+    
+    out = paste0(
+      sapply(c(hours, minutes, seconds), function(x) {
+        formatC(x, width = 2, format = "d", flag = "0")
+      }), collapse = ":")
+    
+    return(out)
+  }else{
+    return(hours)
+  }
+}
+
+
+
+
+#  Authors: Maksym Bondarenko mb4@soton.ac.uk
+#  Date :  October 2017
+#  Version 0.1
+#
+#' wpZonalStatistics function compute zonal statistics. That is,
+#' cross-tabulate the values of a Raster* object
+#' based on a "zones" RasterLayer. NA values are removed.
+#' Function uses DoParallel library to work with a big raster data
+#'
+#' @param x Raster* object
+#' @param y RasterLayer object with codes representing zones
+#' @param fun The function to be applied. Either as character: 'mean', 'min', 'max' and 'sum'
+#' @param cores Integer. Number of cores for parallel calculation
+#' @param minblk Integer. Minimum number of blocks
+#' @param na.rm using na.rm = TRUE for missing data
+#' @param silent If FALSE then the progress will be shown
+#' @rdname wpZonalStatistics
+#' @return A data.frame with a value for each zone (unique value in zones)
+#' @export
+#' @examples
+#' wpZonalStatistics( x=rasterObj1, y=rasterObj2, cores=2, minblk=4  )
+#'
+wpZonalStatistics <- function(x,
+                              y,
+                              fun = 'mean',
+                              cores = NULL,
+                              minblk = NULL,
+                              na.rm = TRUE,
+                              silent = TRUE) {
+  
+  #chack_pkg_load("raster","doParallel")
+  
+  fun <- tolower(fun)
+  if (length(fun) > 1) {
+    fun <- fun[1]
+  }
+  
+  if (!fun %in% c('sum', 'mean', 'sd', 'min', 'max', 'count')) {
+    stop("fun can be 'sum', 'mean', 'sd', 'min', 'max', or 'count'")
+  }
+  
+  # get real physical cores in a computer
+  max.cores <- detectCores(logical = TRUE)
+  
+  if (is.null(cores)) {
+    cores <- max.cores - 1
+  }
+  
+  if (cores > max.cores) {
+    stop(paste0("Number of cores ",
+                cores,
+                " more then real physical cores in PC ",
+                max.cores ))
+  }
+  
+  if (is.null(minblk)) {
+    minblk <- wpGetBlocksNeed(x, cores, n = 1)
+  }
+  
+  compareRaster(c(x, y))
+  stopifnot(hasValues(x))
+  stopifnot(hasValues(y))
+  
+  layernames <- names(x)
+  
+  blocks <- blockSize(x, minblocks = minblk)
+  
+  tStart <- Sys.time()
+  
+  cl <- makeCluster(cores)
+  
+  # broadcast the data and functions to all worker
+  # processes by clusterExport
+  # clusterExport(cl, c(x,"y", "blocks"))
+  
+  registerDoParallel(cl)
+  
+  
+  result <- foreach(i = 1:blocks$n,
+                    .combine = rbind,
+                    .packages = 'raster') %dopar%
+    {
+      
+      df.x <- data.frame( getValues(x,
+                                    row = blocks$row[i],
+                                    nrows = blocks$nrows[i]) )
+      df.y <- data.frame( getValues(y,
+                                    row = blocks$row[i],
+                                    nrows = blocks$nrows[i]) )
+      
+      
+      if ( fun == 'mean' | fun == 'sd' ) {
+        
+        df.fun <- aggregate(x = (df.x), 
+                            by = list(df.y[,1]),
+                            FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                                na.rm = na.rm),
+                            na.rm = na.rm)
+        df.length <- aggregate(x = (df.x),
+                               by = list(df.y[,1]),
+                               FUN = function(x, na.rm = na.rm) length(stats::na.omit(x)),
+                               na.rm = na.rm)
+        
+        colnames(df.length) <- c(layernames,'length')
+        colnames(df.fun) <- c(layernames,'sum')
+        
+        df <- merge(df.fun, df.length, all = TRUE, by = layernames)
+        
+        if (fun == 'sd') {
+          
+          df.sq <- aggregate(x = (df.x^2),
+                             by = list(df.y[,1]),
+                             FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                                 na.rm = na.rm),
+                             na.rm = na.rm)
+          colnames(df.sq) <- c(layernames,'sq')
+          df <- merge(df, df.sq, all = TRUE, by = layernames)
+          
+        }
+        
+      } else if ( fun == 'count') {
+        
+        df <- aggregate(x = (df.x),
+                        by = list(df.y[,1]),
+                        FUN = function(x, na.rm=na.rm) length(stats::na.omit(x)),
+                        na.rm = na.rm)
+        
+        colnames(df) <- c(layernames,'count')
+        
+      } else if ( fun == 'sum') {
+        
+        df <- aggregate(x = (df.x),
+                        by = list(df.y[,1]),
+                        FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                            na.rm = na.rm),
+                        na.rm = na.rm)
+        
+        colnames(df) <- c(layernames,'sum')	
+        
+        
+      } else {      
+        
+        df <- aggregate(x = (df.x),
+                        by = list(df.y[,1]),
+                        FUN = fun,
+                        na.rm = na.rm)
+        
+        colnames(df) <- c(layernames,fun)
+      }
+      
+      return(df)
+    }
+  
+  stopCluster(cl)
+  
+  if ( fun == 'mean' | fun == 'sd') {
+    
+    df1 <- aggregate(x = result$sum,
+                     by = list(result[[1]]),
+                     FUN = 'sum',
+                     na.rm = na.rm)
+    df2 <- aggregate(x = result$length,
+                     by = list(result[[1]]),
+                     FUN = 'sum',
+                     na.rm = na.rm)
+    df1$x <- df1$x / df2$x
+    
+    if (fun == 'sd') {
+      
+      df3 <- aggregate(x = result$sq,
+                       by = list(result[[1]]),
+                       FUN = 'sum', na.rm = na.rm)
+      df1$x <- sqrt(( (df3$x / df2$x) - (df1$x)^2 ) * (df2$x / (df2$x - 1)))
+      colnames(df1) <- c(layernames, 'sd')
+      
+    } else{
+      
+      colnames(df1) <- c(layernames,'mean')
+      
+    }
+    
+  } else if ( fun == 'count') {
+    
+    df1 <- aggregate(x = result[[2]],
+                     by = list(result[[1]]),
+                     FUN = 'sum',
+                     na.rm = na.rm)
+    
+    colnames(df1) <- c(layernames,'count')
+    
+  } else if ( fun == 'sum') {
+    
+    df1 <- aggregate(x = result[[2]],
+                     by = list(result[[1]]),
+                     FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                         na.rm = na.rm),
+                     na.rm = na.rm)
+    
+    colnames(df1) <- c(layernames,'sum')	
+    
+  } else{
+    
+    df1 <- aggregate(x = result[[2]],
+                     by = list(result[[1]]),
+                     FUN = fun,
+                     na.rm = na.rm)
+    
+    colnames(df1) <- c(layernames,fun)
+    
+  }
+  
+  tEnd <-  Sys.time()
+  
+  if (!silent) print(paste("Elapsed Processing Time:", wpTimeDiff(tStart,tEnd)))
+  
+  return(df1)
+}
+```
+
+#  Data and Study Area
+##  Spatial Population Data Preprocessing
+
+The Guadalajara areal population data is rather unique. The urbanised and settled areas, even the smaller settlement agglomerations, are rather detailed, approximating 30m^2^ in some places (Figure 1)[]. These population data are unique for a few reasons besides their high resolution. First, these polygons capture not only city blocks, but in some cases individual buildings. Additionally, there are areas of true zeros such as industrial estates and even large (block length) urban planter boxes. Lastly, these data, within settled areas, do not cover streets, meaning that the polygons within settled areas (of a certain size) are not connected. This is particularly interesting at the more peri-urban interface where these data go from non-connected blocks of buildings to partially or fully connected Thiessen-like polygons.  These characteristics present some unique opportunities in terms of modelling structure and data for population modelling. For example, determining if a polygonal area is more or less urbanised (relatively) can be done by looking at the number of first order neighbours they have; if they have one or more, they are peri-urban to more rural and can be then divided into either a urbanised or rural training set. Note, urban and rural are loosely used here to indicate the relative density of settlement and the built environment.
+
+```{r figure_1, echo = FALSE}
+knitr::include_graphics("figures/figure_1.png")
+```
+
+We initially read in the polygons, removed all features that corresponded to water bodies (field "GUBID_INT" equal to zero), corrected the geometry of all polygons, and rewrote them to file.
+
+```{r clean_census_polygons, eval = FALSE}
+input_polygon_path <- paste0(prj_dir,
+                             "gla_admin_shape_csv/",
+                             "gla_admin.shp")
+
+outdir <- paste0(prj_dir, "/Census/")
+
+id_field_name <- "GUBID_INT"
+
+input_polygon <- st_read(input_polygon_path,
+                         stringsAsFactors = FALSE) %>%
+  filter(GUBID_INT != 0)
+
+valid_geom_table <- table(st_is_valid(input_polygon))
+
+if (valid_geom_table["FALSE"] > 0) {
+  input_polygon <- st_make_valid(input_polygon)
+}
+
+st_write(input_polygon,
+         paste0(outdir,"MEX_admin_cleaned.shp"),
+         "MEX_admin_cleaned",
+         delete_layer = T)
+```
+
+We then need to take that cleaned data and expand the polygon boundaries to where they all touch. We accomplish this by expanding the boundaries as we would in the process of defining Thiessen polygons. We do this within \proglang{Python} using the package `momepy` and the morphological tessellation procedure. The cleaned polygons, which had areas of "no data" corresponding to areas covered by streets later served as our validation areas when examining the modelled, gridded population surfaces. The tessellated polygons later served as the input for the creation of the simulated polygons holding population data, which themselves later served as the source areas in our dasymetric disaggregation of counts.
+
+```{python tessellate_settlement_polygons, eval = FALSE, python.reticulate = FALSE}
+import geopandas as gpd
+import momepy as mm
+
+df = gpd.read_file("/Users/martin/Downloads/MEX_settlement_polygons/MEX_settlement_polygons.shp")
+
+df.crs
+
+df
+
+%time limit = df.buffer(500).unary_union
+
+%time tess = mm.Tessellation(df, 'GUBID_INT', limit=limit, segment=2, shrink=1)
+
+tess.tessellation.to_file("/Users/martin/Downloads/MEX_settlement_tessellation")
+
+tess.tessellation
+```
+
+
+##  Input Areal Population Data Descriptives
+We'll make some quick descriptive figures of the population data below.
+```{r areal_population_desc, message = FALSE, warning = FALSE}
+validation_shp_path <- paste0(prj_dir, "Census/MEX_admin_cleaned.shp")
+tessel_shp_path <- paste0(prj_dir,
+                     "Census/MEX_admin_cleaned_fully_tessellated_UTM_13N.shp")
+validation_shp <- st_read(validation_shp_path)
+validation_shp <- validation_shp %>%
+  mutate(AREA = as.numeric(st_area(validation_shp))) %>%
+  st_drop_geometry() %>%
+  dplyr::select(GUBID_INT, AREA) %>%
+  mutate(DATA = "Validation") 
+tessel_shp <- st_read(tessel_shp_path)
+tessel_shp <- tessel_shp %>%
+  mutate(AREA = as.numeric(st_area(tessel_shp))) %>%
+  st_drop_geometry() %>%
+  dplyr::select(GUBID_INT, AREA) %>%
+  mutate(DATA = "Tessellated")
+area_df <- rbind(validation_shp, tessel_shp)
+
+rm(validation_shp, tessel_shp)
+gc()
+
+hist_grob <- ggplot(area_df,
+                    aes(x = log10({AREA/1000000}), 
+                        fill = DATA)) +
+  geom_density(alpha = 0.2) + 
+  coord_cartesian(xlim = c(-5,2)) +
+  theme_bw() +
+  labs(x = "Polygon Area (log10(Sq. Km))")
+plot(hist_grob)
+```
+
+#  Methods
+##  Census Simulation
+We wanted to simulate areal population count data that were synthetically degraded in their spatial resolution, i.e. there are less areal units (polygons) covering the same area, and containing the population count equal to the sum of constituent units, with a coarser average spatial resolution. To do so, we decided to quasi-randomly select polygons and merge them with their neighbour that has the least difference in average population density. We say quasi-random as the selection was based upon probabilities defined by an exponential curve over the distribution of polygon areas which made the selection preferentially sample smaller, i.e. more urbanised, polygons for merging. We determined this to be appropriate as the majority of population and polygons are located in urbanised areas and we did not want a scenario where the majority of less densely populated areas, typically characterised by larger polygons, were always aggregated firstly. We determined the scale factor to use in defining the probability curve based upon trial and error and settled on the value of `4` as providing a balanced mix of more densely populated and less densely populated polygons being selected for merging across the entire merging progression. The merging criteria was to minimise the loss in variability of the population density values. 
+
+To make sure the simulated aggregation of the polygon-based population count data was both random but replicable, we, randomly, defined 100 random seeds to be used. This meant that for each target level of simulated aggregation, e.g. 95%, 85%, 75%, ..., 15%, 10% of original units, we had 100 different simulated versions. This was done to allow for the creation of bootstrap estimated point estimates and confidence intervals of any error metrics of interest.
+
+The process of sampling and dissolving thousands to tens of thousands of polygons is a surprisingly resource intensive process, which increases with the number of random iterations, i.e. 100, we are doing for each target number of simulated units. We therefore decided to carry out the simulated aggregation procedure in a High Performance Computing (HPC) environment, specifically the Barkla HPC at the University of Liverpool. Like many HPC environments, Barkla uses the Slurm job scheduler to take and execute job submissions. we decided to submit jobs that took several command-line-style arguments that were then passed to the R-based function that was executed by each job. To further speed this process up, we decided to define the job script to allow for arrays of arguments, i.e. a text-based file that defined the command-line-style arguments with one job per line and the arguments separated by whitespace, to be submitted with multiple jobs in a single HPC command.
+
+This meant that we had one flexible *job submission script*, that called upon one *executable R script* that took command-line passed arguments that were retrieved from the line, in the text-based *job list*, corresponding to the *job index*, or indices, submitted in the HPC command. For example, we may have the job submission script `foo_job.sh`, written in \proglang{Bash}, that can take job array indices as inputs and retrieve the corresponding arguments for each sub-job (one per index) from the text-based job list `foo_job_list.txt`. When calling the job submission script in the HPC command, for each sub-job, e.g. `1-10` would have `10` sub-jobs where `1` would have arguments on line `1` of the job list file and so on, the sub-job specific arguments retrieved from the job list would be passed to the executable script `foo_script.R` that would then run with the specified computing resources. 
+
+Given that the executable script is set up to run in parallel, this means that we also defined a function to carry out the aggregation subprocess. We therefore have the following nest of processes, from lowest (\proglang{R} individual aggregation subprocess) to highest level (HPC job submission script): aggregation subprocess (`simulate_coarser_units_PARALLEL()`), the \proglang{R}-based executable script (`simulate_aggregate_units_HPC.R`), and the text-based job list (`simulate_aggregate_units_HPC_job_list.txt`) and the corresponding Bash-based job submission script (`simulate_aggregate_units_HPC.sh`). We'll now walk through each of these.
+
+###  Polygon simulation - single simulation
+As stated, the \proglang{R} executable script runs multiple simulations in parallel using a "task-farm" style setup where each parallel process, i.e. each random seed provided to the script via command arguments, calls the function `simulate_coarser_units_PARALLEL()`. This function takes an input set of input polygons and create a more spatially coarse set of polygons for use in disaggregation modelling testing. Units will be semi-randomly sampled, with smaller units being preferentially selected. Once selected, the selected unit will be aggregated with its neighbouring polygon (queen rule) that has the smallest difference in average population density. This is to minimize the loss of variance in the unit average population densities that later go into the random forest model. Aggregated units retained the unique ID of the selected unit, the populations were summed, and the area and population density will be recalculated prior to the next sampling and aggregation step. This procedure is continued until the desired number of spatial units are met. Units could be aggregated multiple times and all aggregations were recorded in a table prior to a final dissolving based upon identical unique IDs. The initial version of this function dissolved the sampled and merge unit together after every iteration, but this was grossly inefficient. We then decided to record the units in the dataframe and then carry out a single dissolve operation at the end when the number of target units had been reached. This reduced the necessary computation time by around 80%. The only parameter in this function is a task index, relative to the tasks given to the script, which the function is then able to retrieve all of the necessary variables from predefined vectors and or using that index. The variables that are either retrieved by the index or defined from arguments passed to the executable script, for use within the function, correspond to: the random seed, the input polygon path, the output directory, a text-based output tag, the number of target units, the id field name, the population field name, the population density field name, the area field name, the probability scale factor (a constant of `4` for this study), and variables indicating if this is a continuation of previous aggregations. Additionally, a text based log file was written for each task that recorded the merging procedure so that the entire procedure was traceable without needing to rerun the simulation.
+
+If the task was a continuation of previous aggregation runs, e.g. the task in question was to achieve a 15% reduction in total units and the 5 and 10% runs had already been done, the last previous run was used as the input polygon (when `input_polygon_path == "xxx"`) and we "skipped" an equivalent number of random samples so that we were not pulling the same samples in each run.
+
+```{r census_simulation, eval = FALSE}
+simulate_coarser_units_PARALLEL <- function(i){
+  if (seed_skip != 0) {
+    seed <- seed_list[[i]]
+    set.seed(seed)
+    
+    sample(1:seed_skip,seed_skip)
+  }else{
+    seed <- seed_list[[i]]
+    set.seed(seed)
+  }  
+  
+  if (input_polygon_path == "xxx") {
+    input_polygon_path <- paste0(previous_directory,
+                                 output_name_pattern,
+                                 ifelse(output_tag == "" | is.null(output_tag),"",
+                                        paste0("_",output_tag)),
+                                 "_seed_",seed,
+                                 "_scale_",probability_scale_factor,
+                                 "_target_", previous_target_units,".shp")
+
+    id_field_name <- substr(id_field_name,1,10)
+    pop_field_name <- substr(pop_field_name,1,10)}
+  
+  
+  
+  logfile <- paste0(output_directory, "Simulation_INFO_Log",
+                    ifelse(output_tag == "" | is.null(output_tag),"",
+                           paste0("_",output_tag,"_")),
+                    "_seed_",seed,
+                    "_scale_",probability_scale_factor,
+                    "_target_", ifelse(input_polygon_path == "xxx",
+                                       previous_target_units,
+                                       target_units),
+                    ".txt")
+
+  log_console_appender <- log4r::console_appender(layout = default_log_layout())
+  log_file_appender <- log4r::file_appender(logfile, append = TRUE,
+                                            layout = default_log_layout())
+  log_logger <- log4r::logger(threshold = "INFO",
+                              appenders = list(log_console_appender, 
+                                               log_file_appender))
+  
+
+  
+  
+  info(log_logger, paste0("Reading in shapefile from ",input_polygon_path))
+  
+  in_shp <- st_read(input_polygon_path)
+  
+
+  ##  PRE-CHECKS AND DEFAULT PARAMETER SETTING  -----
+  if (sub(".*LENGTHUNIT\\[\\\"([a-z]*)\\\".*", 
+          "\\1",
+          grep(".*LENGTHUNIT.*",
+               strsplit(st_crs(in_shp)$wkt,"\\n")[[1]],
+               value = TRUE,
+               perl = TRUE)[1],
+          perl = TRUE) != "metre") {
+    stop("Input shapefile is unprojected! Please project the data to a linear unit of metres and retry.")
+  }
+  
+  if (is.null(target_units)) {target_units <- ceiling(nrow(in_shp)/3*2)}
+
+  info(log_logger, paste0("Starting with ", nrow(in_shp)," spatial units."))
+  info(log_logger, paste0("No. of target units is ", target_units))
+  
+
+  if (is.null(area_field_name) | is.null(pop_density_field_name)) {
+    info(log_logger,"     Calculating area for input units...")
+    area_field_name <- "AREA"
+    in_shp[,area_field_name] <- 0
+    in_shp[,area_field_name] <- as.numeric(st_area(in_shp))/1000000
+  }
+  
+
+  if (is.null(pop_density_field_name)) {
+    info(log_logger, "     Calculating population density for input units...")
+    pop_density_field_name <- "POP_DENS"
+    in_shp <- in_shp %>% 
+      mutate(!!pop_density_field_name := !!as.name(pop_field_name)/!!as.name(area_field_name))
+  }
+  
+  
+  info(log_logger, paste0("Creating simulated aggregation with seed value of ", seed))
+  info(log_logger,"     Starting...")
+  
+
+  iteration <- 1
+  
+  foo_shp <- in_shp %>%
+    mutate(GUBID_INT = as.character(GUBID_INT))
+  orig_units <- nrow(foo_shp)
+  
+  shp_df <- st_drop_geometry(foo_shp[,])
+  
+
+  while (length(unique(shp_df[,id_field_name])) > target_units) {
+    info(log_logger, paste0("Overall progress: ", 
+                            round({{orig_units - length(unique(shp_df[,id_field_name]))} / {orig_units - target_units} * 100},
+                                  digits = 0), "%"))
+    info(log_logger, 
+         "     Calculating sampling probabilities based upon unit area...     ")
+    
+    shp_df <- shp_df %>%
+      arrange(desc(.data[[area_field_name[[1]]]])) %>%
+      mutate(SAMPLE_W = 1/{1 + {{.data[[area_field_name[[1]]]] -min(.data[[area_field_name[[1]]]])}/{max(.data[[area_field_name[[1]]]]) - min(.data[[area_field_name[[1]]]])}}}**probability_scale_factor[[1]]) %>%
+      mutate(SAMPLE_P = SAMPLE_W/sum(SAMPLE_W))
+    
+    
+    foo_sample_ID <- sample(x = as.character(pull(shp_df, !!id_field_name)),
+                            size = 1,
+                            prob = as.numeric(pull(shp_df, SAMPLE_P)))
+    info(log_logger, paste0("     Sampling polygon ID: ", foo_sample_ID))
+    
+    
+    index_sample <- which(as.character(pull(shp_df, !!id_field_name)) == foo_sample_ID)
+    
+
+    sampled_popdens <- shp_df %>%
+      filter(.data[[id_field_name[[1]]]] == foo_sample_ID[[1]]) %>%
+      pull(.data[[pop_density_field_name[[1]]]]) %>%
+      as.numeric() %>%
+      dplyr::first()
+    
+    sampled_area <- shp_df %>%
+      filter(.data[[id_field_name[[1]]]] == foo_sample_ID[[1]]) %>%
+      pull(.data[[area_field_name[[1]]]]) %>%
+      as.numeric() %>%
+      dplyr::first()
+    
+    sampled_population <- shp_df %>%
+      filter(.data[[id_field_name[[1]]]] == foo_sample_ID[[1]]) %>%
+      pull(.data[[pop_field_name[[1]]]]) %>%
+      as.numeric() %>%
+      dplyr::first()
+    
+    
+    info(log_logger, "     Calculating neighbors...     ")
+    foo_buffer <- foo_shp %>%
+      filter(.data[[id_field_name[[1]]]] %in% foo_sample_ID) %>%
+      st_buffer(1) %>%
+      group_by(.data[[id_field_name[[1]]]]) %>%
+      summarise(geometry = sf::st_union(geometry)) %>%
+      ungroup()
+    
+    foo_neighbors <- foo_shp[unlist(st_intersects(foo_buffer,foo_shp)),] %>% 
+      filter(!(.data[[id_field_name[[1]]]] %in% foo_sample_ID))
+    
+    info(log_logger,paste0("     Retrieved ", nrow(foo_neighbors),
+                           " neighbors of sampled unit...     "))
+    
+    foo_neighbors <- foo_neighbors %>%
+      mutate(POP_DEN = abs(.data[[pop_density_field_name[[1]]]] - sampled_popdens[[1]]))
+    
+
+    min_diff <- min(foo_neighbors$POP_DEN)
+    merge_neighbor_ID <- foo_neighbors %>%
+      filter(POP_DEN == min(POP_DEN)) %>%
+      dplyr::select(.data[[id_field_name[[1]]]]) %>%
+      st_drop_geometry() %>%
+      unlist() %>%
+      as.character() %>%
+      unique()
+    
+    
+    merged_area <- shp_df %>%
+      filter(.data[[id_field_name[[1]]]] %in% merge_neighbor_ID) %>%
+      distinct() %>%
+      pull(.data[[area_field_name[[1]]]]) %>%
+      as.numeric() %>%
+      sum(na.rm = TRUE)
+    
+    merged_population <- shp_df %>%
+      filter(.data[[id_field_name[[1]]]] %in% merge_neighbor_ID) %>%
+      distinct() %>%
+      pull(.data[[pop_field_name[[1]]]]) %>%
+      as.numeric() %>%
+      sum(na.rm = TRUE)
+    
+
+    merged_popdens <- merged_population/merged_area
+    info(log_logger, paste0("     Merging polygon ",merge_neighbor_ID, 
+                            " with population density of ",merged_popdens, 
+                            " and area of ",
+                            merged_area,"...     "))
+    
+    
+    resultant_population <- sampled_population + merged_population
+  
+    resultant_area <- sampled_area + merged_area
+    
+    resultant_popdens <- resultant_population/resultant_area
+    
+    merge_idx <- which(shp_df[,id_field_name] %in% merge_neighbor_ID)
+    
+    shp_df <- as.data.table(shp_df)
+    
+    shp_df[get(id_field_name) %in% c(merge_neighbor_ID, foo_sample_ID),
+      (pop_field_name) := resultant_population]
+    
+    shp_df[get(id_field_name) %in% c(merge_neighbor_ID, foo_sample_ID),
+      (area_field_name) := resultant_area]
+    
+    shp_df[get(id_field_name) %in% c(merge_neighbor_ID, foo_sample_ID),
+      (pop_density_field_name) := resultant_popdens]
+    
+    shp_df[get(id_field_name) %in% c(merge_neighbor_ID, foo_sample_ID),
+       (id_field_name) := foo_sample_ID]
+    shp_df <- shp_df %>% as.data.frame()
+    
+    
+    foo_shp[as.numeric(unlist(st_drop_geometry(foo_shp[, id_field_name]))) %in% merge_neighbor_ID,
+            id_field_name] <- foo_sample_ID
+    
+    
+    info(log_logger,"     Recording the merging in the main table...     ")
+    
+    merge_record_for_log <- sprintf(paste0("MERGE RECORD //// ",
+                                           "Seed %s // ",
+                                           "Iteration %s // ",
+                                           "Selected.Unit %s // ",
+                                           "Merged.Unit %s // ",
+                                           "Selected.AREA %s // ",
+                                           "Selected.POP %s // ",
+                                           "Selected.POPDENS %s // ",
+                                           "Merged.AREA %s // ",
+                                           "Merged.POP %s // ",
+                                           "Merged.POPDENS %s // ",
+                                           "Resultant.AREA %s // ",
+                                           "Resultant.POP %s // ",
+                                           "Resultant.POPDENS %s"),
+                                    seed,
+                                    iteration,
+                                    ifelse(length(foo_sample_ID) > 1,
+                                           paste(foo_sample_ID, 
+                                                 sep = ", ", collapse = ", "),
+                                           foo_sample_ID),
+                                    ifelse(length(merge_neighbor_ID) > 1,
+                                           paste(merge_neighbor_ID, 
+                                                 sep = ", ", collapse = ", "),
+                                           merge_neighbor_ID),
+                                    sampled_area,
+                                    sampled_population,
+                                    sampled_popdens,
+                                    ifelse(length(merged_area) > 1,
+                                           paste(merged_area,
+                                                 sep = ", ", collapse = ", "),
+                                           merged_area),
+                                    ifelse(length(merged_population) > 1,
+                                           paste(merged_population,
+                                                 sep = ", ", collapse = ", "),
+                                           merged_population),
+                                    ifelse(length(merged_popdens) > 1,
+                                           paste(merged_popdens,
+                                                 sep = ", ", collapse = ", "),
+                                           merged_popdens),
+                                    resultant_area,
+                                    resultant_population,
+                                    resultant_popdens)
+    info(log_logger, merge_record_for_log)
+    
+    iteration <- iteration + 1
+    
+    rm(foo_buffer, foo_neighbors)
+    gc()
+  }
+
+  info(log_logger,"     Dissolving geometries and merging data back into the sf object...     ")
+  
+  
+  duplicated_ids_logical <- foo_shp %>% 
+    pull(.data[[id_field_name[[1]]]]) %>%
+    duplicated()
+  duplicated_ids <- pull(foo_shp, .data[[id_field_name[[1]]]])[duplicated_ids_logical]
+  
+  shp_df_mergeable <- shp_df %>%
+    select(-c(SAMPLE_W,SAMPLE_P)) %>%
+    distinct()
+
+  dissolved_shp <- foo_shp %>%
+    filter(.data[[id_field_name[[1]]]] %in% duplicated_ids) %>%
+    group_by(.data[[id_field_name[[1]]]]) %>%
+    summarise(geometry = sf::st_union(geometry)) %>%
+    ungroup()  %>%
+    left_join(shp_df_mergeable, by = id_field_name)
+  
+  foo_shp <- foo_shp %>%
+    filter(!(.data[[id_field_name[[1]]]] %in% unique(shp_df[duplicated(shp_df[,id_field_name]),id_field_name]))) %>%
+    rbind(dissolved_shp)
+  
+  output_name <- paste0(output_name_pattern,
+                        ifelse(output_tag == "" | is.null(output_tag),"",
+                               paste0("_",output_tag,"_")),
+                        "_seed_",seed,
+                        "_scale_",probability_scale_factor,
+                        "_target_",target_units,".shp")
+  
+  info(log_logger,
+       paste0("     Writing shapefile to ",
+              output_directory,output_name))
+  
+  st_write(foo_shp,
+           dsn = paste0(output_directory,output_name),
+           layer = strsplit(output_name,".shp")[[1]],
+           delete_layer = TRUE)
+  print("")
+  print("")
+  info(log_logger,
+       "     Simulation COMPLETE!     ")
+}
+```
+
+### Polygon simulation - task farm
+We now define our cluster task farm, command passed argument handling, and defining of fixed variables within the `simulate_aggregate_units_HPC.R` script. This script handles the input command arguments passed to the script by the job submission script, which retrieves the values from the job list. The main directory paths are hard coded as well as some other user defined parameters that are likely to be project specific and not change much. This could be shifted to the job list at some point, but would drastically expand the number of command arguments that need to be handled and passed for each job. We also source our `simulate_coarser_units_PARALLEL()` function during this script as well. Importantly, we have hard coded our random seeds within this script, which could be reworked in the future to be declared within the job list arguments as well.
+
+
+```{r simulate_aggregate_units_HPC, eval = FALSE}
+##  COMMANDLINE ARGUMENT RETRIEVAL  --------------------------------------------
+args <- commandArgs(trailingOnly = TRUE)
+target_units <- as.numeric(eval(parse(text = args[1])))
+
+input_polygon_path <- sub('`(/.*[.]shp)`|(xxx)',
+                          "\\1",
+                          as.character(parse(text = args[2])),
+                          perl = TRUE)
+
+seed_indices <- seq(as.numeric(eval(parse(text = args[3]))),
+                    as.numeric(eval(parse(text = args[4]))),
+                    by = 1)
+previous_target_units <- as.numeric(eval(parse(text = args[5])))
+
+if (input_polygon_path == "xxx") {
+  seed_skip <- as.numeric(eval(parse(text = args[6])))}else{seed_skip <- 0}
+
+cluster_workers <- as.numeric(eval(parse(text = args[7])))
+
+
+##  USER DEFINED PARAMETERS  ---------------------------------------------------
+hpc_root <- "/mnt/lustre/users/jjniev01/"
+hpc_prj_dir <- paste0(hpc_root,"Research/Mexico_2021/")
+
+source(paste0(hpc_prj_dir, "repo/DENSIFICAR/accessory/create_aggregate_test_units_PARALLEL_optimised.R"))
+
+
+##  Declare our hardcoded input values  ----------------------------------------
+output_directory <- paste0(hpc_prj_dir,
+                           "Output/")
+previous_directory <- paste0(hpc_prj_dir, "Census/Simulated/")
+temporary_directory <- paste0(hpc_prj_dir,"tmp/")
+output_name_pattern <- "MEX_admin_SIMULATED_Aggregation"
+output_tag <- ""
+
+overwrite <- TRUE
+id_field_name <- "GUBID_INT"
+pop_field_name <- "P2010"
+pop_density_field_name <- NULL
+area_field_name <- NULL
+probability_scale_factor <- 4
+
+
+
+
+#####  -------  NOTHING BELOW HERE NEEDS TO BE CHANGED REGULARLY  -------  #####
+seed_list_master <- list(1244621,16542,343433,23574,23463,
+                         44930,2345335,789211,1123,15550,
+                         66503,78328,86937,16522,35699,
+                         72550,765,11240,37511,99567,
+                         2347,76866,69844,7684,3345,
+                         
+                         88795,86732,12559,7693,6589,
+                         65318, 9937,7646,881366,2388,
+                         86443,76445,19873,29875,634529,
+                         76329,48194,7459,357661,88353,
+                         6583,339875,856334,24623,19640122,
+                         
+                         853201,83535,74594,112994,322223,
+                         274,85375,9189,8832,85732,
+                         88233,75559,738412,28334,89553,
+                         90045,23228,26535,876409,345992,
+                         255,46677,749322,86355,27532,
+                         
+                         5567,344465,85766,264891,183332,
+                         8602,34855,86323,869345,12332,
+                         86304,6623,8604,28563,68921,
+                         873452,2863,96782,28953,76514,
+                         849664,46658,55671,89934,907902)
+
+
+seed_list <- seed_list_master[[seed_indices]]
+
+if (input_polygon_path == "xxx") {
+  input_polygon_path <- paste0(previous_directory,
+                               output_name_pattern,
+                               ##  Output tag if it exists
+                               ifelse(output_tag == "" | is.null(output_tag),"",
+                                      paste0("_",output_tag)),
+                               ##  basic info on the simulation to include in the file name:
+                               "_seed_",seed,
+                               "_scale_",probability_scale_factor,
+                               "_target_", previous_target_units,".shp")
+  id_field_name <- substr(id_field_name,1,10)
+  pop_field_name <- substr(pop_field_name,1,10)
+}
+
+sprintf("Values that have been retrieved from the command arguments in R:")
+sprintf("Target Units: %s", target_units)
+sprintf("Input Polygon Paths: %s", input_polygon_path)
+sprintf("Seed Indices: %s", seed_indices)
+sprintf("Previous Target Units: %s",previous_target_units)
+sprintf("Seed Skip: %s",seed_skip)
+sprintf("Cores: %s---",cluster_workers)
+
+
+
+
+##  TASK FARM DEFINITION  ------------------------------------------------------
+cluster_simulate_aggregate_units <- function(seed_list, 
+                                             ...) {
+  tStart <- Sys.time()
+
+  cl <- makeSOCKcluster(cluster_workers)
+  on.exit( stopCluster(cl) )
+  
+  nodes <- length(cl)
+  
+  clusterEvalQ(cl, {
+    require(sf)
+    require(dplyr)
+    require(data.table)
+    require(snow)
+    require(log4r)
+  })
+
+  clusterExport(cl, 
+                c("target_units",
+                  "output_directory", 
+                  "previous_directory",
+                  "temporary_directory",
+                  "output_tag",
+                  "output_name_pattern",
+                  "input_polygon_path",
+                  "id_field_name",
+                  "pop_field_name",
+                  "pop_density_field_name",
+                  "probability_scale_factor",
+                  "area_field_name",
+                  "seed_list",
+                  "seed_skip",
+                  "previous_target_units",
+                  "simulate_coarser_units_PARALLEL",
+                  "overwrite"))
+  
+
+  for (i in 1:nodes) {
+    sendCall(cl[[i]], simulate_coarser_units_PARALLEL, i, tag = i)
+  }
+  
+  cat("Total tasks to process: ", length(seed_list), "\n")
+  for (i in 1:length(seed_list)) {
+    predictions <- recvOneData(cl)
+    
+    if (!predictions$value$success) {
+      stop("ERROR: Cluster barfed...\n\n", predictions)
+    }
+    
+    block <- predictions$value$tag
+
+    ni <- nodes + i
+    if (ni <= length(seed_list)) {
+      sendCall(cl[[predictions$node]], 
+               simulate_coarser_units_PARALLEL,
+               ni,
+               tag = ni)
+    }
+    tEnd <- Sys.time()
+    wpProgressMessage(i,
+                      max = length(seed_list),
+                      label = paste0("Received simulation ", ni,
+                                     " Processing Time: ",
+                                     wpTimeDiff(tStart, tEnd)))
+  }
+}
+
+
+
+
+cluster_simulate_aggregate_units(seed_list = seed_list)
+```
+
+
+### Polygon simulation - job list
+
+Because of efficiency that decreased exponentially after a certain point, we defined each job in the simulated aggregation to only reduce the number of polygons by 5% at a time and run 20 random seeds in parallel. This means that to simulate 100 random simulations of a decrease of 5% of the total original number of polygon units would require 5 sub-jobs, i.e. lines in the text-based job list. 
+
+Our simulation situation, based upon input data and computational resources and efficiency limitations is as follows:
+
+* 55,146 initial polygons
+* 100 random seeds to be used to create 100 random simulations
+* Each job decreases the number of polygons, via merging, by 5% of the initial total (2,758 polygons each job)
+* Each job carries out the merging for 20 of the 100 random seeds
+* If the job is not the initial reduction, i.e. from 100% to 95%, we declare a flag, "xxx", indicating that the previous, random seed-specific reduced output should be the input for this job
+     + e.g. for the reduction of 95% to 90% for random seed "A" we would retrieve the 95% polygons corresponding to random seed "A"
+
+Rather than write out the job list, which contains almost 2000 individual jobs in our situation, we wrote a \proglang{R} script that programmatically created a job list. This script created the jobs, reducing the total number of polygons from 100% to 10% by 5% increments for 100 random seeds making sure there was seed specific continuity in the reduction process. It also hard coded constants such as the number of cores to request in the HPC job submission.
+
+```{r simulate_aggregate_job_list_maker_HPC, eval = FALSE}
+output_job_file <- paste0(prj_dir,"repo/DENSIFICAR/hpc_versions/simulate_aggregate_units_HPC_task_list.txt")
+
+initial_units <- 55146
+
+end_units <- round({initial_units*0.1}, digits = 0)
+
+target_increment <- 2758
+
+
+number_of_seeds <- 100
+
+cores <- 10
+
+input_polygon_paths <- c('\"`/mnt/lustre/users/jjniev01/Research/Mexico_2021/Census/MEX_admin_cleaned_fully_tessellated_UTM_13N.shp`\"')
+
+continuation_path_code <- 'xxx'
+
+##  Nothing below here needs regular changing or input  ------------------------
+number_of_jobs_per_target <- number_of_seeds/cores
+
+target_units <- c(rep(seq({initial_units - target_increment},
+                          round(end_units),
+                          by = {-1*target_increment}),
+                      each = number_of_jobs_per_target), 
+                  rep(end_units, number_of_jobs_per_target))
+
+previous_units <- c(rep(0, number_of_jobs_per_target),
+                    lag(target_units, 
+                        n = cores)[!is.na(lag(target_units, 
+                                              n = number_of_jobs_per_target))])
+array_task_index_start <- rep(seq(1, 
+                                  number_of_seeds,
+                                  by = cores), 
+                              times = {length(target_units)/length(number_of_jobs_per_target)/length(seq(1, 
+                                                                                                         number_of_seeds,
+                                                                                                         by = cores))})
+array_task_index_end <- rep(seq(cores, 
+                                number_of_seeds,
+                                by = cores),
+                            times = {length(target_units)/length(number_of_jobs_per_target)/length(seq(10, 
+                                                                                                       number_of_seeds,
+                                                                                                       by = cores))})
+seed_skip <- {initial_units - target_units}
+seed_skip[1:number_of_jobs_per_target] <- 0
+
+paths <- c(rep(input_polygon_paths, 
+               times = number_of_jobs_per_target),
+           rep(continuation_path_code, 
+               times = {length(array_task_index_start) - number_of_jobs_per_target}))
+
+
+job_df <- data.frame(target_units, paths, array_task_index_start, array_task_index_end, previous_units, seed_skip)
+
+
+write.table(job_df,
+            file = output_job_file,
+            sep = " ",
+            row.names = FALSE,
+            col.names = FALSE,
+            eol = "\n")
+```
+
+An example of the first 15 lines of the job list are shown below. The items in a line, separated by whitespace are: the initial number of polygons for the run, the input file path or continuation tag ("xxx"), the starting random seed index, the ending random seed index, the previous initial polygons, and the number of previously merged polygons, which also corresponds to the number of random samples that need to be done to "skip" previously sampled values in the random seed.
+
+```{txt simulate_aggregate_job_list_file_example, eval = FALSE}
+52388 "`/mnt/lustre/users/jjniev01/Research/Mexico_2021/Census/MEX_admin_cleaned_fully_tessellated_UTM_13N.shp`" 1 20 0 0
+52388 "`/mnt/lustre/users/jjniev01/Research/Mexico_2021/Census/MEX_admin_cleaned_fully_tessellated_UTM_13N.shp`" 21 40 0 0
+52388 "`/mnt/lustre/users/jjniev01/Research/Mexico_2021/Census/MEX_admin_cleaned_fully_tessellated_UTM_13N.shp`" 41 60 0 0
+52388 "`/mnt/lustre/users/jjniev01/Research/Mexico_2021/Census/MEX_admin_cleaned_fully_tessellated_UTM_13N.shp`" 61 80 0 0
+52388 "`/mnt/lustre/users/jjniev01/Research/Mexico_2021/Census/MEX_admin_cleaned_fully_tessellated_UTM_13N.shp`" 81 100 0 0
+49630 xxx 1 20 52388 5516
+49630 xxx 21 40 52388 5516
+49630 xxx 41 60 52388 5516
+49630 xxx 61 80 52388 5516
+49630 xxx 81 100 52388 5516
+46872 xxx 1 20 49630 8274
+46872 xxx 21 40 49630 8274
+46872 xxx 41 60 49630 8274
+46872 xxx 61 80 49630 8274
+46872 xxx 81 100 49630 8274
+```
+
+### Polygon simulation - job submission script
+
+We now come to the final element, which is defining the \proglang{Bash} script that is used for submitting jobs. The header of this script indicates the requested processing time, the number of nodes, the number of cores within each node, where to write the output and error messages, and where to send an email when the job ended or failed. It then loads software modules on the HPC, necessary for running the R script, writes some logging information about the HPC environment and job variables, and retrieves the arguments from the job list file `simulate_aggregate_units_HPC_task_list.txt` before writing their values in the log as well. It finally runs the actual `simulate_aggregate_units_HPC.R` script, using the `Rscript` command, followed by the arguments retrieved from the job list.
+
+```{bash, simulate_aggregate_units_HPC_sh, eval = FALSE}
+#!/bin/bash -l
+# Dash l option is necessary to request a login session and ensure that env modules can be loaded
+#SBATCH -D ./
+# Indicates that the current directory (of the .sh script) should be used for the location of the executables and files
+#SBATCH --job-name=dens_sim
+#SBATCH --time=15:00:00          # walltime
+#SBATCH --output=Out.%J         # Name of the output log file
+#SBATCH --error=Err.%J          # Name of the error log file
+#SBATCH --export=ALL
+#SBATCH --nodes=1               # Number of nodes
+#SBATCH --ntasks=20             # CPU cores to allocate
+# Request the memory on the node or request memory per core
+# PLEASE don't set the memory option as we should use the default memory which is based on the number of cores 
+##SBATCH --mem-per-cpu=9500M
+#SBATCH --mail-type=END,FAIL 
+#SBATCH --mail-user=xxxxxxxxxxxx@liverpool.ac.uk
+
+# Set the maximum stack size to unlimited
+ulimit -s unlimited
+# Set OpenMP thread number
+export OMP_NUM_THREADS=$SLURM_NTASKS
+
+# Load the necessary modules
+module purge
+module load libs/proj/8.0.0/gcc-5.5.0+sqlite-3.35.4
+module load libs/gdal/3.2.2/gcc-5.5.0+proj-8.0.0
+module load libs/geos/3.8.1/gcc-5.5.0
+module load apps/R/4.1.0/gcc-5.5.0+lapack-3.5.0+blas-4.1.0
+
+module list
+
+# Edit to match your own executable and stdin (/dev/null if no stdin)
+# Note the assumption about where these reside in your home directory! 
+#EXEC=./standardise_migrations_age_race_sex_HPC
+#STDIN=./infile
+##STDIN=/dev/null
+#
+#
+echo =========================================================   
+echo SLURM job: submitted  date = `date`      
+date_start=`date +%s`
+
+echo -------------  
+echo Job output begins                                           
+echo -----------------                                           
+echo
+
+hostname
+
+echo "Print the following environmental variables:"
+echo "Job name                     : $SLURM_JOB_NAME"
+echo "Job ID                       : $SLURM_JOB_ID"
+echo "Job user                     : $SLURM_JOB_USER"
+echo "Job array index              : $SLURM_ARRAY_TASK_ID"
+echo "Submit directory             : $SLURM_SUBMIT_DIR"
+echo "Temporary directory          : $TMPDIR"
+echo "Submit host                  : $SLURM_SUBMIT_HOST"
+echo "Queue/Partition name         : $SLURM_JOB_PARTITION"
+echo "Node list                    : $SLURM_JOB_NODELIST"
+echo "Hostname of 1st node         : $HOSTNAME"
+echo "Number of nodes allocated    : $SLURM_JOB_NUM_NODES or $SLURM_NNODES"
+echo "Number of processes          : $SLURM_NTASKS"
+echo "Number of processes per node : $SLURM_TASKS_PER_NODE"
+echo "Requested tasks per node     : $SLURM_NTASKS_PER_NODE"
+echo "Requested CPUs per task      : $SLURM_CPUS_PER_TASK"
+echo "Scheduling priority          : $SLURM_PRIO_PROCESS"
+
+echo   
+echo "Running R job:"
+echo   
+
+# Retrieve our arguments we wish to pass to the R script from the job array file
+lineid=0
+
+# Read a file line by line where IFS is the Input Field Separator (what entries are spearated by, in this case a single whitespace)
+# We will have each separated value stored as individual variables
+while IFS=' ' read -r col1 col2 col3 col4 col5 col6; do
+# Increase our line counter
+  lineid=$((lineid+1))
+# If the line ID is equivalent to our $SLURM_ARRAY_TASK_ID
+# current sub-job only deals with the line with the same line id as SLURM_ARRAY_TASK_ID
+  if [ "$lineid" -eq "$SLURM_ARRAY_TASK_ID" ];then
+    # Declare our variables
+    TARGET_UNITS=$col1
+    INPUT_POLY_PATH=$col2
+    SEED_INDEX_START=$col3
+    SEED_INDEX_END=$col4
+    PREVIOUS_UNITS=$col5
+    SEED_SKIP=$col6
+    echo "Line $lineid:"
+    echo "Target Units: $TARGET_UNITS"
+    echo "Input Polygon Path: $INPUT_POLY_PATH"
+    echo "Seed Index Start: $SEED_INDEX_START"
+    echo "Seed Index End: $SEED_INDEX_END"
+    echo "Previous Units: $PREVIOUS_UNITS"
+    echo "Seed Skip: $SEED_SKIP"
+    # End of if statement (that's what fi is for).
+  fi
+done < simulate_aggregate_units_HPC_task_list.txt
+
+#  Run the actual stuff
+Rscript --no-restore --no-save --vanilla --slave simulate_aggregate_units_HPC.R $TARGET_UNITS $INPUT_POLY_PATH $SEED_INDEX_START $SEED_INDEX_END $PREVIOUS_UNITS $SEED_SKIP $SLURM_NTASKS
+
+# the ret flag is the return code, so you can spot easily if your code failed.
+ret=$?
+
+echo   
+echo ---------------                                           
+echo Job output ends                                           
+date_end=`date +%s`
+seconds=$((date_end-date_start))
+minutes=$((seconds/60))
+seconds=$((seconds-60*minutes))
+hours=$((minutes/60))
+minutes=$((minutes-60*hours))
+echo =========================================================   
+echo SLURM job: finished   date = `date`   
+echo Total run time : $hours Hours $minutes Minutes $seconds Seconds
+```
+
+
+# APPENDIX A: Utility Functions
+
+This is a function to make sure that directories exist. If it does not exist, it creates the directory and returns the input directory path.
+```{r ensure_dir, eval = FALSE}
+##  Function to make sure directories exist:
+ensure_dir <- function(d){
+  ##  Function for ensuring that a directory exists and creating it if it does 
+  ##  not; returns the path of the input path
+  if (!dir.exists(d)) {
+    dir.create(d)
+  }
+  return(d)
+}
+```
+
+```{r package_prep, include = FALSE}
+##  Function to load and or install packages:
+package_prep <- function(...){
+  libs <- unlist(list(...))
+  ##  Check if the packages can be loaded and are already installed:
+  req <- unlist(lapply(libs, require, character.only = TRUE))
+  ##  Packages we need to install:
+  need <- libs[req = FALSE]
+  if (length(need) > 0) {
+    ##  Install the needed packages
+    install.packages(need)
+    ##  Load the just installed packages:
+    lapply(need, require,character.only = TRUE)
+  }
+}
+```
+```{r wpGetOS, eval = FALSE}
+# Authors: Maksym Bondarenko mb4@soton.ac.uk
+# Date :  October 2017
+# Version 0.1
+#
+#' wpGetOS function will return a string with OS
+#' of the system
+#' Tested on Windows 10
+
+#' @rdname wpGetOS
+#' @return string
+wpGetOS <- function(){
+  sysinf <- Sys.info()
+  if (!is.null(sysinf)) {
+    OS <- tolower(sysinf['sysname'])
+    if (OS == 'windows') {
+      return('windows')
+    } else if (OS == 'darwin') {
+      return('osx')
+    } else if (OS == 'linux') {
+      return('linux')
+    }
+  } else { ## other OS
+    OS <- .Platform$OS.type
+    if (grepl("^darwin", R.version$os))
+      return('osx')
+    if (grepl("linux-gnu", R.version$os))
+      return('linux')
+  }
+}
+```
+
+```{r wpGetAvalMem, eval = FALSE}
+# Authors: Maksym Bondarenko mb4@soton.ac.uk
+# Date :  October 2017
+# Version 0.1
+#
+#' wpGetAvalMem function will return avalible
+#' of the system memory in GB
+#' Tested on Windows 10
+#'
+#' @rdname wpGetAvalMem
+#' @return numeric
+wpGetAvalMem <- function(){
+  
+  OS = tolower(wpGetOS())
+  
+  if (OS == 'windows') {
+    memavail = shell('wmic OS get FreePhysicalMemory /Value', intern = T)
+    memavail = memavail[grep('FreePhysicalMemory', memavail)]
+    memavail = as.numeric(gsub('FreePhysicalMemory=','',memavail))
+  }else if (OS == 'osx') {
+    memavail = as.numeric(unlist(strsplit(system("sysctl hw.memsize", intern = T), split = ' '))[2])/1e3
+  }else{
+    memavail = as.numeric(system(" awk '/MemTotal/ {print $2}' /proc/meminfo", intern = T))
+  }
+  
+  return(memavail / (1024 * 1024))
+}
+```
+
+
+```{r wpGetBlocksNeed, eval = FALSE}
+# Authors: Maksym Bondarenko mb4@soton.ac.uk
+# Date :  October 2017
+# Version 0.1
+#
+#' wpGetBlocksNeed function will return a number of blocks
+#' sugesting for processing raster file. It will take into consideration
+#' number of layers, cells, cores and avalible memory on computer
+#' (not maximum memory but avalible)
+#' @param x raster
+#' @param cores number of cores
+#' @param n parameter to increase requrement of the raster
+#' @param number_type Will be used to estimate requred memory
+#' @rdname wpGetBlocksNeed
+#' @return integer
+#' @export
+#' @examples
+#' wpGetBlocksNeed( x, cores=2, n=1 )
+#'
+wpGetBlocksNeed <- function(x, cores, n=1, number_type = "numeric"){
+  
+  #stopifnot(hasValues(x))
+  
+  n <- n + nlayers(x) - 1
+  cells <- round( 1.1 * ncell(x) ) * n
+  #memneed <- cells * 8 * n / (1024 * 1024)
+  
+  if (number_type == "integer") {
+    
+    byte_per_number = 4
+    
+  } else if (number_type == "numeric") {
+    
+    byte_per_number = 8
+    
+  } else {
+    
+    #byte_per_number = .Machine$sizeof.pointer
+    stop(sprintf("Unknown number_type: %s", number_type))
+  }
+  
+  blocks <- 1
+  
+  memneed <- (cells * byte_per_number * n / (1024 * 1024 * 1024))/blocks
+  
+  memavail <- wpGetAvalMem()/cores
+  
+  while ((memneed > memavail)) {
+    
+    memneed <- (cells * byte_per_number * n / (1024 * 1024 * 1024))/blocks
+    blocks <- blocks + 1
+  }
+  
+  if ( blocks < cores) blocks <- cores
+  
+  return(blocks)
+  
+}
+```
+
+
+```{r wpProgressMessage, eval = FALSE}
+##  https://github.com/worldpopglobal/wpUtilities/blob/master/R/wpProgressMessage.R
+wpProgressMessage <- function(x, 
+                              max = 100,
+                              label=NULL) {
+  
+  if (is.null(label)) label = ''
+  if (x != max) ar = '>' else ar = ''
+  
+  percent <- x / max * 100
+  cat(sprintf('\r[%-50s] %d%% %s',
+              paste(paste(rep('=', percent / 2), collapse = ''),'',sep = ar),
+              floor(percent),
+              label))
+  if (x == max)
+    cat('\n')
+}
+```
+
+
+```{r wpTimeDiff, eval = FALSE}
+##  https://github.com/worldpopglobal/wpUtilities/blob/master/R/wpTimeDiff.R
+wpTimeDiff <- function(start, end, frm="hms") {
+  
+  dsec <- as.numeric(difftime(end, start, units = c("secs")))
+  hours <- floor(dsec / 3600)
+  
+  if (frm == "hms" ) {
+    minutes <- floor((dsec - 3600 * hours) / 60)
+    seconds <- dsec - 3600*hours - 60*minutes
+    
+    out = paste0(
+      sapply(c(hours, minutes, seconds), function(x) {
+        formatC(x, width = 2, format = "d", flag = "0")
+      }), collapse = ":")
+    
+    return(out)
+  }else{
+    return(hours)
+  }
+}
+```
+
+
+```{r wpZonalStatistics, eval = FALSE}
+#  Authors: Maksym Bondarenko mb4@soton.ac.uk
+#  Date :  October 2017
+#  Version 0.1
+#
+#' wpZonalStatistics function compute zonal statistics. That is,
+#' cross-tabulate the values of a Raster* object
+#' based on a "zones" RasterLayer. NA values are removed.
+#' Function uses DoParallel library to work with a big raster data
+#'
+#' @param x Raster* object
+#' @param y RasterLayer object with codes representing zones
+#' @param fun The function to be applied. Either as character: 'mean', 'min', 'max' and 'sum'
+#' @param cores Integer. Number of cores for parallel calculation
+#' @param minblk Integer. Minimum number of blocks
+#' @param na.rm using na.rm = TRUE for missing data
+#' @param silent If FALSE then the progress will be shown
+#' @rdname wpZonalStatistics
+#' @return A data.frame with a value for each zone (unique value in zones)
+#' @export
+#' @examples
+#' wpZonalStatistics( x=rasterObj1, y=rasterObj2, cores=2, minblk=4  )
+#'
+wpZonalStatistics <- function(x,
+                              y,
+                              fun = 'mean',
+                              cores = NULL,
+                              minblk = NULL,
+                              na.rm = TRUE,
+                              silent = TRUE) {
+  
+  #chack_pkg_load("raster","doParallel")
+  
+  fun <- tolower(fun)
+  if (length(fun) > 1) {
+    fun <- fun[1]
+  }
+  
+  if (!fun %in% c('sum', 'mean', 'sd', 'min', 'max', 'count')) {
+    stop("fun can be 'sum', 'mean', 'sd', 'min', 'max', or 'count'")
+  }
+  
+  # get real physical cores in a computer
+  max.cores <- detectCores(logical = TRUE)
+  
+  if (is.null(cores)) {
+    cores <- max.cores - 1
+  }
+  
+  if (cores > max.cores) {
+    stop(paste0("Number of cores ",
+                cores,
+                " more then real physical cores in PC ",
+                max.cores ))
+  }
+  
+  if (is.null(minblk)) {
+    minblk <- wpGetBlocksNeed(x, cores, n = 1)
+  }
+  
+  compareRaster(c(x, y))
+  stopifnot(hasValues(x))
+  stopifnot(hasValues(y))
+  
+  layernames <- names(x)
+  
+  blocks <- blockSize(x, minblocks = minblk)
+  
+  tStart <- Sys.time()
+  
+  cl <- makeCluster(cores)
+  
+  # broadcast the data and functions to all worker
+  # processes by clusterExport
+  # clusterExport(cl, c(x,"y", "blocks"))
+  
+  registerDoParallel(cl)
+  
+  
+  result <- foreach(i = 1:blocks$n,
+                    .combine = rbind,
+                    .packages = 'raster') %dopar%
+    {
+      
+      df.x <- data.frame( getValues(x,
+                                    row = blocks$row[i],
+                                    nrows = blocks$nrows[i]) )
+      df.y <- data.frame( getValues(y,
+                                    row = blocks$row[i],
+                                    nrows = blocks$nrows[i]) )
+      
+      
+      if ( fun == 'mean' | fun == 'sd' ) {
+        
+        df.fun <- aggregate(x = (df.x), 
+                            by = list(df.y[,1]),
+                            FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                                na.rm = na.rm),
+                            na.rm = na.rm)
+        df.length <- aggregate(x = (df.x),
+                               by = list(df.y[,1]),
+                               FUN = function(x, na.rm = na.rm) length(stats::na.omit(x)),
+                               na.rm = na.rm)
+        
+        colnames(df.length) <- c(layernames,'length')
+        colnames(df.fun) <- c(layernames,'sum')
+        
+        df <- merge(df.fun, df.length, all = TRUE, by = layernames)
+        
+        if (fun == 'sd') {
+          
+          df.sq <- aggregate(x = (df.x^2),
+                             by = list(df.y[,1]),
+                             FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                                 na.rm = na.rm),
+                             na.rm = na.rm)
+          colnames(df.sq) <- c(layernames,'sq')
+          df <- merge(df, df.sq, all = TRUE, by = layernames)
+          
+        }
+        
+      } else if ( fun == 'count') {
+        
+        df <- aggregate(x = (df.x),
+                        by = list(df.y[,1]),
+                        FUN = function(x, na.rm=na.rm) length(stats::na.omit(x)),
+                        na.rm = na.rm)
+        
+        colnames(df) <- c(layernames,'count')
+        
+      } else if ( fun == 'sum') {
+        
+        df <- aggregate(x = (df.x),
+                        by = list(df.y[,1]),
+                        FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                            na.rm = na.rm),
+                        na.rm = na.rm)
+        
+        colnames(df) <- c(layernames,'sum')	
+        
+        
+      } else {      
+        
+        df <- aggregate(x = (df.x),
+                        by = list(df.y[,1]),
+                        FUN = fun,
+                        na.rm = na.rm)
+        
+        colnames(df) <- c(layernames,fun)
+      }
+      
+      return(df)
+    }
+  
+  stopCluster(cl)
+  
+  if ( fun == 'mean' | fun == 'sd') {
+    
+    df1 <- aggregate(x = result$sum,
+                     by = list(result[[1]]),
+                     FUN = 'sum',
+                     na.rm = na.rm)
+    df2 <- aggregate(x = result$length,
+                     by = list(result[[1]]),
+                     FUN = 'sum',
+                     na.rm = na.rm)
+    df1$x <- df1$x / df2$x
+    
+    if (fun == 'sd') {
+      
+      df3 <- aggregate(x = result$sq,
+                       by = list(result[[1]]),
+                       FUN = 'sum', na.rm = na.rm)
+      df1$x <- sqrt(( (df3$x / df2$x) - (df1$x)^2 ) * (df2$x / (df2$x - 1)))
+      colnames(df1) <- c(layernames, 'sd')
+      
+    } else{
+      
+      colnames(df1) <- c(layernames,'mean')
+      
+    }
+    
+  } else if ( fun == 'count') {
+    
+    df1 <- aggregate(x = result[[2]],
+                     by = list(result[[1]]),
+                     FUN = 'sum',
+                     na.rm = na.rm)
+    
+    colnames(df1) <- c(layernames,'count')
+    
+  } else if ( fun == 'sum') {
+    
+    df1 <- aggregate(x = result[[2]],
+                     by = list(result[[1]]),
+                     FUN = function(x, na.rm = TRUE) sum(as.numeric(x),
+                                                         na.rm = na.rm),
+                     na.rm = na.rm)
+    
+    colnames(df1) <- c(layernames,'sum')	
+    
+  } else{
+    
+    df1 <- aggregate(x = result[[2]],
+                     by = list(result[[1]]),
+                     FUN = fun,
+                     na.rm = na.rm)
+    
+    colnames(df1) <- c(layernames,fun)
+    
+  }
+  
+  tEnd <-  Sys.time()
+  
+  if (!silent) print(paste("Elapsed Processing Time:", wpTimeDiff(tStart,tEnd)))
+  
+  return(df1)
+}
+```
